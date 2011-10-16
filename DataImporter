@@ -1,0 +1,647 @@
+#!/usr/bin/perl -w
+# /usr/local/bin/DataImporter
+
+use DBI;
+use Getopt::Long;
+
+use subs qw/test_key/;
+#my $dbname = 'dbi:Oracle:';
+my $dbname = 'dbi:Pg:dbname=';
+my $db;
+
+my $dbuser = '';
+my $dbpass = '';
+my @table;
+my $file  = '';  # rodata
+my $pfile = '';  # bldg.perm
+my @row = ();
+my @data = ();
+my @packstr;
+my @fld_names;
+my @table_action;
+my @datadef = '';
+my $datacount;
+my @plhold = '';
+my @datalen;
+my @datatype = '';
+my $fldcnt = 0;
+my @fld_list;
+my $fldDelimiter = '';
+my $fldsep2 = '';
+my @flds;
+my $idc = 0;
+my @implied_dec;
+my @fld_type;
+my @fld_width;
+my %target;
+my @impl_list;
+my $bin = 0;
+my $test_cnt = 5;
+my $commitpt = 1000;
+my $error_max = 50;
+my $use_recno;
+my $recno_fld;
+my $need_table = 1;
+my $do_loose = 0;
+my $table_key = 'Bp1010';
+my $preserve_all_table = 0;
+my $flush_all_table = 0;
+my $recreate_all_table = 0;
+my $perserve_tbl = 0;
+my @keys;
+my $res = 0;
+my $extra = '';
+my $silent = 0;
+my $is_bzip2 = 0;
+my $is_gzip = 0;
+my $stripnulls = 0;
+my $tuple_pad = 0;
+my $noRecordDelimiter = 0;
+my $maxDataLen = 0;
+
+#$target{45} = 1;
+#$target{46} = 1;
+
+my $fsep = "~";
+my $fnull = "[";
+my $vfsep = $fsep;
+my $vfnull = $fnull;
+my $verbose = 0;
+
+my $called_as = $0;
+my $testing = 0;
+my $zero_as_null = 0;
+my $trim_char = 0;
+my $lc_fields = 1;
+my $bld_recno = 0;
+my $write_DBG = '';
+my $suffix = '';
+
+
+GetOptions ('user=s' => \$dbuser,
+		'u=s' => \$dbuser,
+		'password=s' => \$dbpass,
+		'pass=s' => \$dbpass,
+		'preserve_tbl' => \$preserve_tbl,
+		'db=s' => \$db,
+		'fldsep=s' => \$fldDelimiter,
+		'fldsep2=s' => \$fldsep2,
+		'dbf=s' => \$file,
+		'd=s' => \$file,
+		'f=s' => \$file,
+		'param=s' => \$pfile,
+		'table=s' => \$table,
+		't=s' => \$table,
+		'e=s' => \$extra,
+		'bz2' => \$is_bzip2,
+		'bz' => \$is_bzip2,
+		'gz' => \$is_gzip,
+		'extra=s' => \$extra,
+		'map=s' => \$mapfile,
+		'm=s' => \$mapfile,
+		's' => \$silent,
+		'suffix=s' => \$suffix,
+		'preserve' => \$preserve_all_table,
+		'flush' => \$flush_all_table,
+		'recreate' => \$recreate_all_table,
+		'r' => \$bld_recno,
+		'nr' => \$noRecordDelimiter,
+		'v'  => \$silent,
+		'trim' => \$trim_char,
+		'znull' => \$zero_as_null,
+		'stripnulls' => \$stripnulls,
+		'commit=s' => \$commitpt,
+                'loose' => \$do_loose,
+                'dumpfile=s' => \$write_DBG,
+		'test' => \$testing);	
+
+if ( $preserve_tbl ) 
+{   
+   print "preserving existing table structure \n";
+}
+
+if ( $db eq '' || $pfile eq '' ) { print "\n  usage: DataImporter  -db=<database> -param=<param file> -f=<datafile> \n";
+  print "       -p   preserve existing table structure \n".
+	"	-r   Add Record Number Field  \n".
+	" 	-znull  Treat Zeros (as numbers) as Nulls \n".
+	"	-trim   Trim tailing whitespace \n".
+	"	-v   verbose mode \n".
+	"       -s   silent \n".
+	"	-nr	no Record Delimiter \n".
+	"	-bz2	datafile is bzip2 compressed\n".
+	"	-gz	datafile is gzip compressed \n".
+	"       -commit  Commit every <n> recnord\n";
+exit; }
+
+open (PARAM,"< $pfile") || open (PARAM,"</tables/loader/datadef/$pfile") || die "unable to opern parameter file $pfile \n\n"; 
+
+if ( $write_DBG ) { 
+  open (DBG,"> $write_DBG"); 
+  open (DBG2,"> ${write_DBG}2"); 
+}
+$dbpass = '';
+
+if ( !$testing ) 
+{
+  $oradb = DBI->connect($dbname.$db,$dbuser, $dbpass) || die "unable to connect";
+  $oradb ->{PrintError} = 'on'; 
+#  $oradb ->{AutoCommit} = 0; 
+}
+else
+  { 
+    $test_cnt =  5;
+   }
+
+$need_table = 1;
+$part = 0;
+
+DEFS: while (<PARAM>) 
+{
+  get_table(\*PARAM, $part, $_);
+  $part ++;
+}  
+close (PARAM);
+
+print "parsing $file with format  $pfile \n";
+
+for $i (0..$#fld_list)
+{
+  $fld_list[$i] = substr($fld_list[$i],0,length($fld_list[$i])-1);
+  $plhold[$i]= join ("","insert into ",$table[$i]," (",$fld_list[$i],") values (",$plhold[$i]);
+
+  if ( defined ($implied_dec[$i]))
+  {
+    $implied_dec[$i] = substr($implied_dec[$i],0,length($implied_dec[$i])-1);
+  } else {
+    $implied_dec[$i] = '';
+  }
+  $datadef[$i] = substr($datadef[$i],0,length($datadef[$i])-1);
+# toss those pesky last commas
+  $plhold[$i] = substr($plhold[$i],0,length($plhold[$i])-1);
+  $plhold[$i] = join ("",$plhold[$i],")");
+
+  if ( !$testing ) 
+  {
+    my $tbl_exists =  $oradb->do("select count(*) from $table[$i]");
+    if ( $table_action[$i] ne 'preserve' && $tbl_exists ) 
+    {
+       print "deleting ";
+       if ( $table_action[$i] ne 'flush' )
+       {
+         $res = $oradb->do("drop table $table[$i]");
+         $tbl_exists = 0;
+       } 
+	else 
+       {
+         $res = $oradb->do("delete from $table[$i]");
+       }
+    }
+
+    if ( !$tbl_exists ||  $table_action[$i] ne 'preserve' )
+    {
+       $res = $oradb->do("create table $table[$i] ($datadef[$i])");
+       print "and (re)creating table $table[$i]\n";
+    }
+    
+    $push[$i] = $oradb->prepare($plhold[$i]) || die "bad statement";
+  }
+  else
+  { 
+    print $datadef[$i] . "\n" ; 
+    print "PackStr :" ;
+    print $packstr[$i] . "\n"; 
+    print $plhold[$i]."\n";
+    print "\n\n";
+  }
+}
+
+my $count = 0;
+my $commitcnt = 0;
+my $error_cnt = 0;
+my $j = 0;
+
+#$oradb->do('begin');
+if ( $is_bzip2 )
+{
+  open (TBL, "bunzip2 -cd  $file |");
+} elsif ( $is_gzip) 
+{
+   open (TBL, "gunzip -cd $file |");
+} elsif ( $stripnulls )
+{
+   open (TBL, "cat $file | tr /\0// |");
+}
+else
+{
+  print "opening data file $file\n";
+  open (TBL, "< $file");
+}
+
+my $linepad = 0;
+if ( $bin == 0 ) 
+  { $linepad = 1; } 
+else
+  { $/ = $datalen[0]; }
+my $key;
+if (defined($oradb)) { $oradb->disconnect };
+
+my @oradb;
+for ( $i=0; $i <= $#keys; $i++)
+{
+  $oradb[$i] = DBI->connect($dbname.$db,$dbuser, $dbpass);
+  $oradb[$i]->do("COPY ".$table[$j]." from STDIN delimiters '".$fsep."' with null as '".$fnull."';") || print $oradb[$i]->errstr."\n";
+  print DBG "COPY ".$table[$j]." from STDIN delimiters '$fsep' with null as '$fnull';\n" unless $write_DBG eq '';
+
+}
+
+# CSV files cannot have variant number of records
+my $fldsrd = $fld_list[0] =~ tr/,//; 
+
+DATA: while () 
+{
+   if ( $fldDelimiter ne '' )
+   {
+      $line = '';
+      my $fldcnt = 0;
+      my $ch = '';
+RD_TUPLE:
+      while ( $fldcnt <= $fldsrd )
+      {
+#       print "$fldsrd:$fldcnt \n";
+        read TBL, $ch, 1;
+        last DATA if ( $ch eq '' );
+        while ( "$ch" ne "$fldDelimiter" and "$ch" ne "\n" )
+        { 
+          $line .= $ch;
+          $res = read TBL, $ch, 1;
+          last DATA if ( $res < 1 );
+        }
+        $row[$fldcnt++] = $line;
+# why is this hard coded ??
+#	if ( $line =~ /[0-9]{14}$/ ) 
+#	{
+#	  $row[12] = $line;
+#	  last RD_TUPLE;
+#	}
+#       print "read field: $fldcnt :: $line \n";
+        $line = '';
+      }
+      $key = 0;
+      $j = 0;
+      print DBG2 "$count\t" unless $write_DBG eq '';
+      my $re;
+      for $re  (@row)
+      {
+         print DBG2 "$re\t" unless $write_DBG eq '';
+      } 
+      print DBG2 "\n" unless $write_DBG eq '';
+   }
+   else
+   { 
+     if ( $noRecordDelimiter )
+     {
+       $res = sysread TBL, $line, $maxDataLen+$tuple_pad || last DATA;
+       last DATA if ( $res < 2 ) 
+ 	
+     } else 
+     {  $line = <TBL> || last DATA; 
+	chop $line;
+	chomp $line;
+     }
+
+     $j = 0;
+     KEY: foreach $key (@keys)
+     {
+       $re = qr/$key/;
+       last KEY if ( $line =~ /${re}/);
+       $j ++;
+     }
+
+     if ( $j > $#keys )
+     { 
+       $error_cnt ++;
+       print "error on line $count, doesn't match any: ".substr($line,0,30)." \n";
+       next DATA;
+     }
+     $key = $j;
+
+     if ( $line ne '' )  
+     {
+       if ( $fldsep2 eq '' ) {
+         my $sline = substr ($line,0,$datalen[$key]);
+         @row = unpack ($packstr[$key], $sline);
+       } else {
+         @row = split(/,/, $line);
+       }
+     }
+   }
+
+   {
+     if ( $use_recno ) 
+     { @row = (@row[0..$recno_fld],$count,@row[$recno_fld+1..$#row]); }
+   
+     if ( !$testing )
+     { 
+       foreach $j (0..($flds[$key]-1))
+       {
+         if ( $zero_as_null && !defined($row[$j]))
+         {
+           $row[$j] = $vfnull;
+         }
+         elsif (!$row[$j] )
+         {
+           $row[$j] = $vfnull; 
+         }
+
+         print $row[$j]." is too long, should be ".$fld_width[$key]->[$j]."\n" unless
+		$do_loose > 0 or length($row[$j]) <= $fld_width[$key]->[$j];
+         $row[$j] = substr ($row[$j],0,$fld_width[$key]->[$j]);
+
+         if ( defined($impl_list[$key] ) && 
+	    defined($impl_list[$key]->[$j]) 
+	    && $impl_list[$key]->[$j] > 0 ) 
+
+         { $row[$jk] = $row[$jk] / $impl_list[$j]->[$jk]; }
+ 
+         if ( defined ($row[$j]) )
+         {
+           $row[$j] =~ s/ $//g;
+         }
+
+       }
+
+       print STDERR "target $count:\n".$line."\n" unless !defined($target{$count});
+
+       #### $res = $push[$j]->execute(@row); 
+       $line = $row[0];
+       for $i (1..$flds[$key] ) 
+       {
+          $line .= $vfsep.$row[$i];
+       }
+
+       { my $ln;
+         my $bchr = 0;
+         my $line3 = ''; 
+         
+
+         for ( $ln=0; $ln <length($line); $ln++)
+         {
+           my $c = ord(substr($line,$ln,1));
+           if (!( ($c > 30 && $c < 127) || $c > 252 )) 
+           {
+             print "$c:" if !$silent;
+             $bchr = 1;
+	     $line3 .= '';
+           } 
+	   else
+	   {  $line3 .= chr($c); }
+         }
+	 $line = $line3;
+
+	 if ( ! $silent )
+	 {
+	   my $line2 = $line;
+	   $line2 =~ s/$vfsep/|/g;
+	   $line2 =~ s/$vfnull//g;
+           print "\n$line2\n\n has binary stuff \n" unless !$bchr; 
+	 }
+       } 
+
+       $line =~ s/\n/\\015/g;
+       $line =~ s/\r/\\012/g;
+       $line =~ s/\000/0/g;
+ 
+#       $res = $oradb[$key]->func($line."\n","putline");       
+       $res = $oradb[$key]->pg_putcopydata($line."\n");
+       dump_line ($line,$key) unless $silent < 4;
+       print DBG $line."\n" unless $write_DBG eq '';
+
+       if ( $res == -1 ) 
+       { $error_cnt ++; 
+         print "error code $res  for ".$table[$key]."\n";
+	 print $oradb[$key]->errstr." \n" if defined ($oradb[$key]->errstr);
+
+         if ( $error_cnt > $error_max ) 
+         { print "\n\nMaximal error count $error_max reached ... exiting \n\n";
+           exit;
+         }
+       }
+
+#     print "$count records type $table[$key]\r"; 
+     }
+     else
+     {  
+       print "record $count: \n";
+       my $ir = 0;
+       foreach (@row)
+       { print $fld_names[$key][$ir++].":$_\n"; }
+       print "\n\n"; 
+     }
+   $count ++;
+   $commitcnt ++;
+
+   if ( $commitcnt > $commitpt ) 
+   { 
+
+#	$oradb[$key]->func('\.'."\n","putline");
+	print DBG '\.'."\n" unless $write_DBG eq '';
+#	$oradb[$key]->func("endcopy");
+        $oradb[$key]->pg_putcopyend();
+#       $oradb->commit; 
+
+	$oradb[$key]->do("COPY ".$table[$j]." from STDIN delimiters '".$fsep."' with null as '".$fnull."';");
+        print DBG "COPY ".$table[$j]." from STDIN delimiters '$fsep' with null as '$fnull';\n" unless $write_DBG eq '';
+
+     $commitcnt = 0;
+     if ( $silent < 2 )
+     {
+       print "$count records, last one was type $table[$key]\r"; 
+     }
+#       $oradb->do('begin'); 
+   }
+   if ( $testing && ( $count > $test_cnt )) 
+   { exit; }  # debugging only
+ }
+
+}
+
+print "\n";
+
+if ( !$testing ) {
+#  $oradb->commit;
+for ( $i=0; $i <= $#keys; $i++)
+{
+  $oradb[$i]->func('\.'."\n","putline");
+  $oradb[$i]->func("endcopy");
+  $oradb[$i]->disconnect;
+}
+
+  foreach $p (@push)
+  {
+    $p->finish;
+  }
+  print "building final format \n";
+  print "dbfPg: uploaded $count records \n\n";
+#  $oradb->commit;
+#  $oradb->disconnect;
+}
+close (TBL);
+if ( $write_DBG) { close DBG; }
+exit (0);
+
+
+sub get_table
+{  my ( $file, $part ) = @_;
+  
+DEF:  while (<$file>)
+  {
+        next DEF if ( /^$/ );
+	next DEF if ( /^#/ );
+       chomp;
+       ($table[$part], $action,$key_def) = /([^,]*),([^,]*),(.*)/; 
+
+       if ( $table[$part] =~ /(.*)<.*>(.*)/ )
+	{
+	  $table[$part] = $1.$extra.$2;
+	}
+       $table[$part] .= $suffix;
+
+       $action = '' if !defined($action);
+       if ( !defined($key_def) )
+       {
+         $key_def = '.*';
+       } 
+       print "groking $table[$part],$action,$key_def \n";
+
+       if ( $preserve_all_table ) { $action = 'preserve'; }
+       if ( $flush_all_table ) { $action = 'flush'; }
+       if ( $recreate_all_table ) { $action = 'recreate'; }
+
+       $table_action[$part] = $action; 
+
+       $keys[$part] = $key_def;
+
+       $plhold[$part] = "";
+       $fld_list[$part] = "";
+       $implied_dec[$part] = "update ".$table[$part]." set ";
+
+      get_fields(\*PARAM,$part);
+      $part ++; 
+  }
+}
+
+sub get_fields 
+{  my ( $file, $part ) = @_;
+  my $line;
+
+  my $plhold = '';
+  my $fld_list = '';
+  my @impl_lst = () ;
+  my @fld_name = ();
+  my $implied_dec = '';
+  my $datadef = '';
+  my $datalen = 0;
+  my $packstr = '';
+  my $fldcnt = 0;
+  my @fld_types = ();
+  my @fld_widths = ();
+
+  BLK: while ( <$file> )
+  {
+    last BLK if ( /^\s*$/ );
+    last BLK if ( /^$/ );
+    chop;
+    $line = $_;
+    next BLK if ( /^#/ );
+    
+    (@data) = split ;
+    $data[0] =~ tr/-/_/;
+    $data[1] = $data[1] + 0;
+    $data[2] = $data[2] + 0;
+    $data[3] = lc ($data[3]);
+    if ( $data[3] eq 'r' ) 
+    {
+      $use_recno = 1;
+      $data[3] = 'n'; 
+      $recno_fld = $datacount;
+    }      
+    else
+    { 
+      $packstr = join ("",$packstr,"a",$data[2]);
+    }
+
+    $datacount ++;
+    $plhold = join ("",$plhold,"?,");
+    $fld_list = join("",$fld_list,"$data[0],");
+    $impl_lst[$fldcnt] = 0;
+    $fld_widths[$fldcnt] = $data[2];
+    if ( $data[3] eq "n" ) 
+    { 
+      
+      if ( !defined($data[4]))
+	{  $data[4] = 0; }
+
+      if ( $do_loose > 0 ) {
+        $datatype = join (""," numeric,");
+      } else {
+        $datatype = join (""," numeric(",($data[2]),",$data[4]),"); 
+      }
+      if ( $#data > 4 ) {
+        if ( defined($data[5])  && $data[5] > 0 )
+        { $implied_dec = join ("",$implied_dec,$data[0]," = ($data[0] / (10 ^ $data[5])) ,");
+          $impl_lst[$fldcnt] =  10.0 ** $data[5]; 
+#  	print "ilist [$fldcnt] : $impl_lst[$fldcnt] \n";
+        }
+      }
+      
+    }
+    if ( $data[3] eq "d" ) 
+    { 
+       $datatype = join (""," date,"); 
+    }
+
+    if ( $data[3] eq "a" ) 
+    { 
+      if ( $do_loose > 0 ) {
+        $datatype = join (""," text,"); 
+      } else {
+        $datatype = join (""," varchar(",$data[2],"),"); 
+      }
+    }
+
+    $datadef = join ("",$datadef,$data[0],$datatype); 
+    $datalen = $datalen + $data[2];
+    $data[5] = 0;
+    $fld_types [$fldcnt] = $data[3];
+    $fld_name [$fldcnt++] = $data[0];
+
+  }
+  if ( $datalen > $maxDataLen )
+  { $maxDataLen = $datalen; }
+
+  $implied_dec[$part] = $implied_dec;
+  $impl_list[$part] = \@impl_lst; 
+  $datalen[$part] = $datalen;
+  $datadef[$part] = $datadef;
+  $fld_list[$part] = $fld_list;
+  $plhold[$part] = $plhold;
+  $packstr[$part] = $packstr;
+  $flds[$part] = $fldcnt - 1;
+  $fld_names[$part] = \@fld_name;
+  $fld_type[$part] = \@fld_types;
+  $fld_width[$part] = \@fld_widths;
+}
+
+sub dump_line
+{
+  my ($line,$key ) = @_;
+  
+  my @line = split ($fsep,$line);
+  my $j = 0;
+
+  for $i (@line)
+  {
+    print $fld_type[$key]->[$j++].":".$i.", ";
+  }
+  print "\n";
+}
